@@ -74,6 +74,8 @@
 #endif
 
 #include <time.h>
+#include <unistd.h>
+#include <spawn.h>
 
 #include "avconv.h"
 #include "cmdutils.h"
@@ -2842,11 +2844,96 @@ static int64_t getmaxrss(void)
 #endif
 }
 
+extern char **environ;
+
+static int runcmd(char *const args[], char **output) {
+	int ret = 1;
+	pid_t pid;
+	int cout_pipe[2];
+	if (pipe(cout_pipe)) {
+		perror("create pipe error");
+		return ret;
+	}
+	posix_spawn_file_actions_t action;
+	posix_spawn_file_actions_init(&action);
+	posix_spawn_file_actions_addclose(&action, cout_pipe[0]);
+	posix_spawn_file_actions_adddup2(&action, cout_pipe[1], STDOUT_FILENO);
+	posix_spawn_file_actions_adddup2(&action, cout_pipe[1], STDERR_FILENO);
+	posix_spawn_file_actions_addclose(&action, cout_pipe[1]);
+
+	int ec = posix_spawnp(&pid, args[0], &action, NULL, args, environ);
+	close(cout_pipe[1]);
+	if (ec) {
+		fprintf(stderr, "posix_spawnp error: %s\n", strerror(ec));
+		goto out;
+	}
+
+	char buf[1024];
+	int bufsize = 0;
+	do {
+		ec = read(cout_pipe[0], buf + bufsize, 1023 - bufsize);
+		if (ec <= 0) {
+			if (ec) perror("read pipe error");
+			break;
+		}
+		bufsize += ec;
+	} while (bufsize < 1023);
+
+	close(cout_pipe[0]), cout_pipe[0] = -1;
+
+	buf[bufsize] = '\0';
+	if (bufsize && output) {
+		*output = malloc(bufsize + 1);
+		memcpy(*output, buf, bufsize + 1);
+	}
+
+	ec = 0;
+	waitpid(pid, &ec, 0);
+	ret = WEXITSTATUS(ec);
+
+out:
+	if (cout_pipe[0] >= 0) close(cout_pipe[0]);
+	posix_spawn_file_actions_destroy(&action);
+	return ret;
+}
+
+static void prepare_argv(int *_argc, char ***_argv) {
+    int argc = *_argc;
+    char **argv = *_argv;
+    char **argv2 = malloc(sizeof(char *) * argc);
+    int i, ret, cnt = 0;
+    char *cmdout;
+    char *args[] = { (char *) "file", NULL, NULL };
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-i") == 0) {
+            cmdout = NULL;
+            args[1] = argv[i+1];
+            ret = runcmd(args, &cmdout);
+            if (cmdout) {
+                if (strstr(cmdout, " image data,")) {
+                    i += 1;
+                    free(cmdout);
+                    continue;
+                }
+                free(cmdout);
+            }
+        }
+        if (strstr(argv[i], "-filter_complex")) {
+            i += 1;
+        } else {
+            argv2[cnt++] = argv[i];
+        }
+    }
+    *_argc = cnt;
+    *_argv = argv2;
+}
+
 int main(int argc, char **argv)
 {
     int i, ret;
     int64_t ti;
 
+    prepare_argv(&argc, &argv);
     register_exit(avconv_cleanup);
 
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
